@@ -1,3 +1,4 @@
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/proc_fs.h>
@@ -10,10 +11,13 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/uaccess.h>
+
+#include <net/netfilter/nf_conntrack.h> // Required for conntrack
+
 #include "minifirewall-def.h"
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Mini Firewall Kernel Module");
+MODULE_DESCRIPTION("Mini Firewall Kernel Module with Conntrack");
 MODULE_AUTHOR("Vivek Shankar");
 
 static struct proc_dir_entry *proc_entry;
@@ -21,7 +25,25 @@ static struct FirewallRule *pHead, *pTail, *pIndex;
 static int iMaxID;
 static struct nf_hook_ops nfho_prerouting, nfho_localin, nfho_localout, nfho_postrouting;
 
+<<<<<<< HEAD
 // Function Prototypes
+=======
+// --- Helper for Connection Tracking ---
+void print_connection_state(struct sk_buff *skb) {
+    struct nf_conn *ct;
+    enum ip_conntrack_info ctinfo;
+
+    ct = nf_ct_get(skb, &ctinfo);
+    if (!ct) {
+        // Many packets won't have a conntrack entry if not tracked
+        return;
+    }
+    // State mapping: 0=ESTABLISHED, 1=RELATED, 2=NEW
+    printk(KERN_INFO "minifirewall: Packet state: %d\n", ctinfo);
+}
+
+// --- Prototypes ---
+
 ssize_t mod_write(struct file *file, const char __user *buff, size_t len, loff_t *off);
 ssize_t mod_read(struct file *file, char __user *page, size_t count, loff_t *off);
 ssize_t delete_rule(struct FirewallRule *pRule);
@@ -34,6 +56,7 @@ static const struct proc_ops minifirewall_proc_ops = {
     .proc_lseek = default_llseek,
 };
 
+
 int init_minifirewall_module(void)
 {
     proc_entry = proc_create("minifirewall", 0644, NULL, &minifirewall_proc_ops);
@@ -42,13 +65,25 @@ int init_minifirewall_module(void)
     pHead = pTail = pIndex = NULL;
     iMaxID = 0;
 
+
+// --- Initialization & Cleanup ---
+int init_minifirewall_module(void) {
+    proc_entry = proc_create("minifirewall", 0644, NULL, &minifirewall_proc_ops);
+    if (!proc_entry) return -ENOMEM;
+    pHead = pTail = pIndex = NULL;
+    iMaxID = 0;
+>>>>>>> 1d4b187 (feat: implement conntrack inspection and fix buffer overflow in mod_write)
     init_nf_module();
     printk(KERN_INFO "minifirewall: Module loaded\n");
     return 0;
 }
 
+
 void cleanup_minifirewall_module(void)
 {
+
+void cleanup_minifirewall_module(void) {
+
     struct FirewallRule *pCurr = NULL;
     cleanup_nf_module();
     remove_proc_entry("minifirewall", NULL);
@@ -63,6 +98,97 @@ void cleanup_minifirewall_module(void)
 module_init(init_minifirewall_module);
 module_exit(cleanup_minifirewall_module);
 
+
+ssize_t mod_read(struct file *file, char __user *page, size_t count, loff_t *off)
+{
+    if (*off > 0 || !pHead) return 0;
+    if (!pIndex) pIndex = pHead;
+    if (copy_to_user(page, pIndex, sizeof(struct FirewallRule))) return -EFAULT;
+    *off += sizeof(struct FirewallRule);
+    pIndex = pIndex->m_pNext;
+    return sizeof(struct FirewallRule);
+
+// --- Rule Logic ---
+unsigned int check_rules(int bInput, unsigned int proto, unsigned int saddr, unsigned int daddr) 
+{
+    struct FirewallRule *pCurr;
+    
+    for (pCurr = pHead; pCurr != NULL; pCurr = pCurr->m_pNext) {
+        // Check if the current rule matches the packet
+        if (pCurr->m_bInput == bInput && (pCurr->m_iProtocol == 0 || pCurr->m_iProtocol == proto)) {
+            
+            // If the rule says to block, we drop and log it
+            if (pCurr->m_bBlock == 1) {
+                // This will show up in your 'dmesg' logs
+                printk(KERN_INFO "minifirewall: DROPPED packet from IP: %pI4\n", &saddr);
+                return NF_DROP;
+            } else {
+                // If the rule is to allow, we accept
+                return NF_ACCEPT;
+            }
+        }
+    }
+    
+    // Default policy: If no rule matches, allow the traffic
+    return NF_ACCEPT;
+
+}
+
+// --- Netfilter Hooks ---
+unsigned int hook_prerouting(unsigned int hooknum, struct sk_buff *skb, const struct net_device *in, const struct net_device *out, int (*okfn)(struct sk_buff*)) {
+    struct iphdr *ip_header = ip_hdr(skb);
+    if (!ip_header) return NF_ACCEPT;
+    
+    print_connection_state(skb); // Inspect the connection
+    return check_rules(1, ip_header->protocol, ip_header->saddr, ip_header->daddr);
+}
+
+unsigned int hook_postrouting(unsigned int hooknum, struct sk_buff *skb, const struct net_device *in, const struct net_device *out, int (*okfn)(struct sk_buff*)) {
+    struct iphdr *ip_header = ip_hdr(skb);
+    if (!ip_header) return NF_ACCEPT;
+    return check_rules(0, ip_header->protocol, ip_header->saddr, ip_header->daddr);
+}
+
+unsigned int hook_localin(unsigned int hooknum, struct sk_buff *skb, const struct net_device *in, const struct net_device *out, int (*okfn)(struct sk_buff*)) { return NF_ACCEPT; }
+unsigned int hook_localout(unsigned int hooknum, struct sk_buff *skb, const struct net_device *in, const struct net_device *out, int (*okfn)(struct sk_buff*)) { return NF_ACCEPT; }
+
+// --- Hook Registration ---
+int init_nf_module(void) {
+    nfho_prerouting.hook = hook_prerouting;
+    nfho_prerouting.hooknum = NF_INET_PRE_ROUTING;
+    nfho_prerouting.pf = PF_INET;
+    nfho_prerouting.priority = NF_IP_PRI_FIRST;
+    nf_register_hook(&nfho_prerouting);
+
+    nfho_localin.hook = hook_localin;
+    nfho_localin.hooknum = NF_INET_LOCAL_IN;
+    nfho_localin.pf = PF_INET;
+    nfho_localin.priority = NF_IP_PRI_FIRST;
+    nf_register_hook(&nfho_localin);
+
+    nfho_localout.hook = hook_localout;
+    nfho_localout.hooknum = NF_INET_LOCAL_OUT;
+    nfho_localout.pf = PF_INET;
+    nfho_localout.priority = NF_IP_PRI_FIRST;
+    nf_register_hook(&nfho_localout);
+
+    nfho_postrouting.hook = hook_postrouting;
+    nfho_postrouting.hooknum = NF_INET_POST_ROUTING;
+    nfho_postrouting.pf = PF_INET;
+    nfho_postrouting.priority = NF_IP_PRI_FIRST;
+    nf_register_hook(&nfho_postrouting);
+
+    return 0;
+}
+
+void cleanup_nf_module(void) {
+    nf_unregister_hook(&nfho_prerouting);
+    nf_unregister_hook(&nfho_localin);
+    nf_unregister_hook(&nfho_localout);
+    nf_unregister_hook(&nfho_postrouting);
+}
+
+// ... (Add your mod_read, mod_write, and delete_rule functions here) ...
 ssize_t mod_read(struct file *file, char __user *page, size_t count, loff_t *off)
 {
     if (*off > 0 || !pHead) return 0;
@@ -72,7 +198,6 @@ ssize_t mod_read(struct file *file, char __user *page, size_t count, loff_t *off
     pIndex = pIndex->m_pNext;
     return sizeof(struct FirewallRule);
 }
-
 ssize_t delete_rule(struct FirewallRule *pRule)
 {
     struct FirewallRule *pCurr = NULL;
@@ -91,6 +216,7 @@ ssize_t delete_rule(struct FirewallRule *pRule)
 
 ssize_t mod_write(struct file *file, const char __user *buff, size_t len, loff_t *off)
 {
+
     struct FirewallRule* pRule = vmalloc(sizeof(struct FirewallRule));
     if (!pRule) return -ENOMEM;
     if (copy_from_user(pRule, buff, len)) { vfree(pRule); return -EFAULT; }
@@ -168,3 +294,44 @@ void cleanup_nf_module(void)
     nf_unregister_hook(&nfho_localout);
     nf_unregister_hook(&nfho_postrouting);
 }
+=======
+    struct FirewallRule* pRule;
+
+    // 1. Sanity check: Ensure we don't try to copy more than the struct size
+    if (len > sizeof(struct FirewallRule)) {
+        return -EINVAL; // Return 'Invalid Argument' error if buffer is too big
+    }
+
+    // 2. Allocate memory
+    pRule = vmalloc(sizeof(struct FirewallRule));
+    if (!pRule) {
+        return -ENOMEM;
+    }
+
+    // 3. Perform the safe copy
+    if (copy_from_user(pRule, buff, len)) { 
+        vfree(pRule); 
+        return -EFAULT; 
+    }
+
+    // 4. Process the rule
+    if (pRule->m_bDeleted == 1) { 
+        delete_rule(pRule); 
+        vfree(pRule); 
+    } else {
+        pRule->m_pNext = NULL; // Good practice: ensure pointers are initialized
+        pRule->m_pPrev = NULL;
+        
+        if (!pHead) { 
+            pHead = pTail = pRule; 
+        } else { 
+            pTail->m_pNext = pRule; 
+            pRule->m_pPrev = pTail; 
+            pTail = pRule; 
+        }
+        pRule->m_iID = ++iMaxID;
+    }
+
+    return len;
+}
+
